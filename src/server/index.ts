@@ -1,20 +1,233 @@
-import express from 'express';
+import express, {type NextFunction, type Request, type Response} from 'express';
 import {fileURLToPath} from 'node:url';
+import type {FuncRevision, JsonObject, PathStep} from '../common/types';
+import {DEFAULT_SAMPLE} from '../common/seed';
+import {queryPaths} from './paths';
+import {MigrationRuntime} from './runtime';
+import {RevisionConflictError, StudioStore, ValidationError} from './store';
+import {RunExecutor} from './executor';
 
-type RecordRow = {id:string;name:string;revision:number;content:string;updatedAt:string};
-const rows: RecordRow[] = [
-  {id:'alpha',name:'Primary schema revisions',revision:3,content:'schema revisions: alpha\nstate: active',updatedAt:new Date(0).toISOString()},
-  {id:'beta',name:'Secondary schema revisions',revision:5,content:'schema revisions: beta\nstate: review',updatedAt:new Date(1000).toISOString()},
-];
+type AsyncHandler = (req: Request, res: Response, next: NextFunction) => Promise<unknown>;
+const wrap =
+  (handler: AsyncHandler) =>
+  (req: Request, res: Response, next: NextFunction): void => {
+    handler(req, res, next).catch(next);
+  };
 
-export function createApp(){
-  const app=express();
-  app.use(express.json({limit:'1mb'}));
-  app.get('/api/bootstrap',(_req,res)=>res.json({family:"schema-evolution",count:rows.length}));
-  app.get('/api/schemas',(_req,res)=>res.json(rows.map(({content,...row})=>row)));
-  app.get('/api/schemas/:id',(req,res)=>{const row=rows.find(value=>value.id===req.params.id);if(!row)return res.status(404).json({error:'not_found'});res.set('ETag',String(row.revision)).json(row)});
-  app.put('/api/schemas/:id',(req,res)=>{const row=rows.find(value=>value.id===req.params.id);if(!row)return res.status(404).json({error:'not_found'});if(req.body.revision!==row.revision)return res.status(409).json({error:'revision_conflict',current:row});row.content=String(req.body.content??'');row.revision+=1;row.updatedAt=new Date().toISOString();res.json(row)});
-  app.post('/api/schemas/:id/analyze',async(req,res)=>{const row=rows.find(value=>value.id===req.params.id);if(!row)return res.status(404).json({error:'not_found'});await new Promise(resolve=>setTimeout(resolve,req.params.id==='alpha'?100:20));res.json({id:row.id,revision:row.revision,lines:String(req.body.content??row.content).split(/\r?\n/).length,diagnostics:[]})});
+export type ExperimentResponse = {
+  experimentId: string;
+  sample: JsonObject;
+  graphRevision: number;
+  candidates: Awaited<ReturnType<typeof queryPaths>>;
+  runs: {key: string; runId?: string; rejected?: string; status: string}[];
+};
+
+export function createApp(store = new StudioStore()) {
+  const app = express();
+  app.use(express.json({limit: '1mb'}));
+  const runtime = new MigrationRuntime();
+  const executor = new RunExecutor(store, runtime);
+
+  function graphPayload() {
+    return {revision: store.getRevision(), graph: store.snapshot()};
+  }
+
+  app.get('/api/bootstrap', (_req, res) => {
+    const {graph, revision} = {graph: store.snapshot(), revision: store.getRevision()};
+    res.json({
+      family: 'schema-evolution',
+      revision,
+      nodeCount: graph.nodes.length,
+      edgeCount: graph.edges.length,
+      funcCount: graph.funcs.length,
+      defaultSample: DEFAULT_SAMPLE,
+    });
+  });
+
+  app.get('/api/graph', (_req, res) => {
+    res.set('ETag', String(store.getRevision()));
+    res.json(graphPayload());
+  });
+
+  // ---- function revisions -------------------------------------------------
+
+  app.get('/api/funcs/:id', (req, res) => {
+    const func = store.snapshot().funcs.find((f) => f.id === req.params.id as string);
+    if (!func) return res.status(404).json({error: 'not_found'});
+    res.json(func);
+  });
+
+  app.post('/api/funcs', wrap(async (req, res) => {
+    const body = req.body ?? {};
+    const revision = parseRevision(body);
+    const func = store.createFunc(
+      {id: body.id, name: String(body.name ?? 'New function'), revision},
+      integer(body.baseRevision),
+    );
+    res.status(201).json({func, ...graphPayload()});
+  }));
+
+  // Publish a NEW revision of a function. Existing edges and running
+  // executions keep binding to the revision they started with.
+  app.put('/api/funcs/:id/revisions', wrap(async (req, res) => {
+    const revision = parseRevision(req.body);
+    const func = store.addFuncRevision(req.params.id as string, revision, integer(req.body.baseRevision));
+    res.json({func, ...graphPayload()});
+  }));
+
+  // ---- graph edits (optimistic concurrency via baseRevision) --------------
+
+  app.put('/api/edges/:id', wrap(async (req, res) => {
+    const edge = store.upsertEdge({...req.body, id: req.params.id as string}, integer(req.body.baseRevision));
+    res.json({edge, ...graphPayload()});
+  }));
+
+  app.post('/api/edges', wrap(async (req, res) => {
+    const edge = store.upsertEdge(req.body ?? {}, integer(req.body.baseRevision));
+    res.status(201).json({edge, ...graphPayload()});
+  }));
+
+  app.delete('/api/edges/:id', wrap(async (req, res) => {
+    store.deleteEdge(req.params.id as string, integer(String(req.query.baseRevision)));
+    res.json(graphPayload());
+  }));
+
+  app.put('/api/nodes/:id', wrap(async (req, res) => {
+    const node = store.upsertNode({...req.body, id: req.params.id as string}, integer(req.body.baseRevision));
+    res.json({node, ...graphPayload()});
+  }));
+
+  // ---- path queries -------------------------------------------------------
+
+  app.post('/api/paths', wrap(async (req, res) => {
+    const {start, goal, sample, reversibleOnly} = readQuery(req.body);
+    const candidates = await queryPaths(store.snapshot(), runtime, {start, goal, sample, reversibleOnly});
+    res.json({revision: store.getRevision(), start, goal, sample, candidates});
+  }));
+
+  // ---- runs ---------------------------------------------------------------
+
+  app.post('/api/runs', wrap(async (req, res) => {
+    const steps = readSteps(req.body?.steps);
+    const sample = asObject(req.body?.sample);
+    const {run} = store.createRun({experimentId: asString(req.body?.experimentId), steps, sample});
+    // Execute detached; clients poll (or the compare endpoint fans out).
+    void executor.start(run.id).catch(() => undefined);
+    res.status(201).json(run);
+  }));
+
+  app.get('/api/runs/:id', (req, res) => {
+    const run = store.getRun(req.params.id as string);
+    if (!run) return res.status(404).json({error: 'not_found'});
+    res.json(run);
+  });
+
+  app.post('/api/runs/:id/cancel', (req, res) => {
+    const ok = executor.cancel(req.params.id as string);
+    if (!ok) return res.status(409).json({error: 'not_cancellable'});
+    const run = store.getRun(req.params.id as string);
+    res.json(run);
+  });
+
+  // ---- experiment: compare multiple paths on one fixed sample -------------
+
+  app.post('/api/compare', wrap(async (req, res) => {
+    const {start, goal, sample, reversibleOnly} = readQuery(req.body);
+    const candidates = await queryPaths(store.snapshot(), runtime, {start, goal, sample, reversibleOnly});
+    const experimentId = `exp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    const runs: ExperimentResponse['runs'] = [];
+    for (const candidate of candidates) {
+      // Skip only paths composition cannot accept. A function that throws in
+      // preview still gets executed: runtime failure is itself a comparison
+      // result (with prior intermediate outputs retained).
+      if (!candidate.valid || candidate.conditionStatus === 'rejected') {
+        runs.push({
+          key: candidate.key,
+          status: 'rejected',
+          rejected:
+            candidate.conditionStatus === 'rejected'
+              ? `condition not met at ${candidate.rejectedAtEdge ?? ''}: ${candidate.rejectedReason ?? ''}`
+              : candidate.rejectedReason ??
+                candidate.schemaIssues.map((i) => `${i.kind}:${i.edgeId}`).join('; '),
+        });
+        continue;
+      }
+      const {run} = store.createRun({experimentId, steps: candidate.steps, sample});
+      void executor.start(run.id).catch(() => undefined);
+      runs.push({key: candidate.key, runId: run.id, status: run.status});
+    }
+    const response: ExperimentResponse = {
+      experimentId,
+      sample,
+      graphRevision: store.getRevision(),
+      candidates,
+      runs,
+    };
+    res.status(201).json(response);
+  }));
+
+  app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (error instanceof RevisionConflictError) {
+      return res.status(409).json({error: 'revision_conflict', current: error.current, ...graphPayload()});
+    }
+    if (error instanceof ValidationError) {
+      return res.status(422).json({error: 'validation_error', details: error.message});
+    }
+    const status = (error as {statusCode?: number})?.statusCode ?? 500;
+    res.status(status).json({error: 'internal_error', details: (error as Error).message});
+  });
+
   return app;
 }
-if(process.argv[1]===fileURLToPath(import.meta.url)){createApp().listen(4174,'127.0.0.1',()=>console.log('server http://127.0.0.1:4174'))}
+
+// ---- request parsing helpers ---------------------------------------------
+
+function integer(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isInteger(n)) throw new ValidationError('baseRevision must be an integer');
+  return n;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function asObject(value: unknown): JsonObject {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new ValidationError('sample must be a JSON object');
+  }
+  return value as JsonObject;
+}
+
+function parseRevision(body: any): FuncRevision {
+  const source = String(body?.source ?? '').trim();
+  if (!source) throw new ValidationError('source is required');
+  const condition = typeof body.condition === 'string' && body.condition.trim() ? body.condition : undefined;
+  return {source, condition, note: String(body.note ?? ''), createdAt: new Date().toISOString()};
+}
+
+function readQuery(body: any) {
+  const start = asString(body?.start);
+  const goal = asString(body?.goal);
+  if (!start || !goal) throw new ValidationError('start and goal are required');
+  const sample = asObject(body?.sample ?? DEFAULT_SAMPLE);
+  return {start, goal, sample, reversibleOnly: Boolean(body?.reversibleOnly)};
+}
+
+function readSteps(value: unknown): PathStep[] {
+  if (!Array.isArray(value) || value.length === 0) throw new ValidationError('steps must be a non-empty array');
+  return value.map((raw) => ({
+    edgeId: String(raw.edgeId),
+    from: String(raw.from),
+    to: String(raw.to),
+    funcId: String(raw.funcId),
+    funcRevision: Number(raw.funcRevision ?? 0),
+    cost: Number(raw.cost ?? 0),
+    reversible: Boolean(raw.reversible),
+    condition: typeof raw.condition === 'string' ? raw.condition : undefined,
+  }));
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  createApp().listen(4174, '127.0.0.1', () => console.log('server http://127.0.0.1:4174'));
+}
